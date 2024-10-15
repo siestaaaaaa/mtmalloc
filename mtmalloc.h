@@ -18,21 +18,21 @@
 // to do: other platforms
 #endif
 
-//in this project, "bytes" means the number of bytes, "size" means the aligned bytes
+// in this project, "bytes" means the number of bytes, "size" means the aligned bytes
 
 namespace mtmalloc {
 
-namespace mtmalloc_internal {
+namespace detail {
 
-//designed
-inline constexpr size_t thread_cache_max_bytes = 256 * 1024; //256KB
-inline constexpr size_t N = 208; //num of the buckets of central_cache and thread_cache
+// designed
+inline constexpr size_t thread_cache_max_bytes = 256 * 1024; // 256KB
+inline constexpr size_t N = 208; // num of the buckets of central_cache and thread_cache
 
-//adjustable
-inline constexpr size_t M = 129; //num of the buckets of page_heap
-inline constexpr size_t page_shift = 13; //page_size: 8KB
+// adjustable
+inline constexpr size_t M = 129; // num of the buckets of page_heap
+inline constexpr size_t PAGE_SHIFT = 13; // page_size: 8KB
 
-//allocate memory from system
+// allocate memory from system
 inline void* sys_alloc(size_t size) {
 #if defined(_WIN32)
     void* ptr = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -44,22 +44,23 @@ inline void* sys_alloc(size_t size) {
         ptr = nullptr;
     }
 #else
-    // to do: other platforms
+    // to do
 #endif
-    assert(ptr != nullptr);
+    // assert(ptr != nullptr);
+    if(ptr == nullptr) {
+        throw std::bad_alloc{};
+    }
     return ptr;
 }
 
-//free memory to system
+// only used when memory is too large to manage
 inline void sys_free(void* ptr) {
 #if defined(_WIN32)
     VirtualFree(ptr, 0, MEM_RELEASE);
 #elif defined(__linux__) || defined(linux)
-    auto cur_brk = reinterpret_cast<intptr_t>(sbrk(0));
-    auto ptr_int = reinterpret_cast<intptr_t>(ptr);
-    sbrk(ptr_int - cur_brk);
+    // to do
 #else
-    // to do: other platforms
+    // to do
 #endif
 }
 
@@ -73,7 +74,7 @@ class helper {
     }
 
 public:
-    //align bytes to size
+    // align bytes to size
     static size_t get_size(size_t bytes) {
         if (bytes <= 128) {
             return align(bytes, 8);
@@ -88,7 +89,7 @@ public:
         }
     }
 
-    //map the bytes to index
+    // map the bytes to index
     static size_t get_index(size_t bytes) {
         static int group_size[4] = {16, 56, 56, 56};
         if (bytes <= 128) {
@@ -104,14 +105,18 @@ public:
             return index_in_group(bytes - 64 * 1024, 13) + group_size[3] + group_size[2] +
                    group_size[1] + group_size[0];
         } else {
-            assert(false);
+            // assert(false);
+            throw std::out_of_range{"bytes out of range"};
             return -1;
         }
     }
 
-    //the num of blocks to allocate
+    // the num of blocks to allocate
     static size_t get_nblock(size_t size) {
-        assert(size > 0);
+        // assert(size > 0);
+        if(size == 0) {
+            throw std::logic_error{"invalid size"};
+        }
 
         auto res = thread_cache_max_bytes / size;
         res = std::max(res, size_t{2});
@@ -119,51 +124,56 @@ public:
         return res;
     }
 
-    //the num of pages to allocate
+    // the num of pages to allocate
     static size_t get_npage(size_t size) {
-        assert(size > 0);
+        // assert(size > 0);
+        if(size == 0) {
+            throw std::logic_error{"invalid size"};
+        }
 
-        auto nblock = get_nblock(size);
-        auto res = (nblock * size) >> page_shift;
+        auto res = (get_nblock(size) * size) >> PAGE_SHIFT;
         res = std::max(res, size_t{1});
         return res;
     }
 
-    //get the head of memory block to memorize the addr of next block
+    // get the head of memory block to memorize the addr of next block
     static void*& next(void* block) {
-        assert(block != nullptr);
+        // assert(block != nullptr);
+        if(block == nullptr) {
+            throw std::logic_error{"dereference a nullptr"};
+        }
         return *static_cast<void**>(block);
     }
 };
 
-//object pool is to allocate memory of fixed length
+// object pool is to allocate memory of fixed length
 template<typename T>
 class object_pool {
-    char* mem_{};           //large continuous memory
-    size_t bytes_{};        //remain bytes
-    void* freelist_{};      //manage free memory blocks
+    char* mem_{};           // large continuous memory
+    size_t bytes_{};        // remain bytes
+    void* freelist_{};      // manage free memory blocks
 
 public:
     object_pool() = default;
-    //not copyable and movable
+
+    // not copyable and movable
     object_pool(const object_pool&) = delete;
     object_pool& operator=(const object_pool&) = delete;
 
-    //new a object
+    // new an object
     T* new_() {
         T* res{};
         if (freelist_) {
-            //pop front to allocate memory
+            // pop front to allocate memory
             auto next = helper::next(freelist_);
             res = static_cast<T*>(freelist_);
             freelist_ = next;
         } else {
-            //allocate from a large continuous memory
+            // allocate from a large continuous memory
             if (bytes_ < sizeof(T)) {
-                bytes_ = 128 * 1024; //adjustable
+                bytes_ = 128 * 1024; // adjustable
                 mem_ = static_cast<char*>(sys_alloc(bytes_));
             }
-            assert(mem_ != nullptr);
             res = reinterpret_cast<T*>(mem_);
             auto stride = sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
             mem_ += stride;
@@ -173,48 +183,52 @@ public:
         return res;
     }
 
-    //delete a object
+    // delete a object
     void delete_(T* ptr) {
         if(ptr == nullptr) {
             return;
         }
         ptr->~T();
-        //push front into freelist_ for re-allocation
+
+        // push front into freelist_ for re-allocation
         helper::next(ptr) = freelist_;
         freelist_ = ptr;
     }
 };
 
-//span is to manage the memory of contiguous pages
+// span is to manage the memory of contiguous pages
 struct span {
-    uintptr_t first_page{}; //<< page_shift to get the page's address
-    size_t page_count_{};   //num of pages
+    uintptr_t first_page{}; // << PAGE_SHIFT to get the page's address
+    size_t page_count_{};   // num of pages
 
-    void* freelist_{};      //manage free memory blocks
-    size_t size_{};         //size of memory blocks
-    size_t use_count_{};    //num of memory blocks that are being used
+    void* freelist_{};      // manage free memory blocks
+    size_t size_{};         // size of memory blocks
+    size_t use_count_{};    // num of memory blocks that are being used
 
-    bool alive_{};          //whether the span is being used
-    span* next_{};          //next span
-    span* prev_{};          //prev span
+    bool alive_{};          // whether the span is being used
+    span* next_{};          // next span
+    span* prev_{};          // prev span
 };
 
 inline object_pool<span> span_pool;
 
 class span_list {
-    span* head_{}; //dummy
+    span* head_{}; // dummy
 
 public:
     span_list() {
         head_ = span_pool.new_();
         head_->next_ = head_->prev_ = head_;
     }
-    //not copyable and movable
+    // not copyable and movable
     span_list(const span_list&) = delete;
     span_list& operator=(const span_list&) = delete;
 
     void push(span* node) const {
-        assert(node != nullptr);
+        // assert(node != nullptr);
+        if(node == nullptr) {
+            throw std::logic_error{"push a nullptr"};
+        }
 
         auto next = begin();
         node->prev_ = head_;
@@ -224,7 +238,10 @@ public:
     }
 
     [[nodiscard]] span* pop() const {
-        assert(!empty());
+        // assert(!empty());
+        if(empty()) {
+            throw std::logic_error{"pop from empty list"};
+        }
 
         auto res = begin();
         erase(res);
@@ -232,8 +249,14 @@ public:
     }
 
     void erase(const span* node) const {
-        assert(node != nullptr);
-        assert(node != head_);
+        // assert(node != nullptr);
+        // assert(node != head_);
+        if(node == nullptr) {
+            throw std::logic_error{"erase an nullptr"};
+        }
+        if(node == head_) {
+            throw std::logic_error{"erase the dummy head"};
+        }
 
         auto next = node->next_;
         auto prev = node->prev_;
@@ -256,22 +279,22 @@ public:
 
 // page_map contains a mapping from page to span
 // If span s occupies pages [p...q]
-//      page_map[p] == s
-//      page_map[q] == s
-//      page_map[p+1...q-1] are undefined
-//      page_map[p-1] and page_map[q+1] are defined:
-//         nullptr if the corresponding page is not yet in the address space
-//         otherwise it points to a span. This span may be free or allocated.
-//         If free, it is in one of page_heap's freelist.
-//
+//       page_map[p] == s
+//       page_map[q] == s
+//       page_map[p+1...q-1] are undefined
+//       page_map[p-1] and page_map[q+1] are defined:
+//          nullptr if the corresponding page is not yet in the address space
+//          otherwise it points to a span. This span may be free or allocated.
+//          If free, it is in one of page_heap's freelist.
+// 
 // page_map can be read without holding any locks
 // and written while holding the page_heap's lock
 template<size_t Bits>
 class page_map {
-    static constexpr int leaf_bits = (Bits + 2) / 3;        //round up
+    static constexpr int leaf_bits = (Bits + 2) / 3;        // round up
     static constexpr int leaf_length = 1 << leaf_bits;
 
-    static constexpr int node_bits = (Bits + 2) / 3;        //round up
+    static constexpr int node_bits = (Bits + 2) / 3;        // round up
     static constexpr int node_length = 1 << node_bits;
 
     static constexpr int root_bits = Bits - leaf_bits - node_bits;
@@ -291,7 +314,8 @@ class page_map {
 
 public:
     page_map() = default;
-    //not copyable and movable
+
+    // not copyable and movable
     page_map(const page_map&) = delete;
     page_map& operator=(const page_map&) = delete;
 
@@ -306,7 +330,11 @@ public:
     }
 
     void set(uintptr_t key, span* val) {
-        assert((key >> Bits) == 0);
+        // assert((key >> Bits) == 0);
+        if((key >> Bits) != 0) {
+            throw std::logic_error{"page_map::set failed"};
+        }
+
         ensure(key, 1);
         auto i1 = key >> (leaf_bits + node_bits);
         auto i2 = (key >> leaf_bits) & (node_length - 1);
@@ -336,44 +364,53 @@ public:
     }
 };
 
-//page_heap is to allocate and deallocate span
+// page_heap is to allocate and deallocate span
 class page_heap {
-    span_list freelists_[M]; //map page_count to span_list
+    span_list freelists_[M]; // map page_count to span_list
 
-    static constexpr size_t Bits = (sizeof(void*) == 8 ? 48 : 32) - page_shift;
+    static constexpr size_t Bits = (sizeof(void*) == 8 ? 48 : 32) - PAGE_SHIFT;
     page_map<Bits> page_to_span_{};
 
     page_heap() = default;
 
 public:
-    mutable std::mutex mtx_; //mutex for page_heap
+    mutable std::mutex mtx_; // mutex for page_heap
 
     page_heap(const page_heap&) = delete;
     page_heap& operator=(const page_heap&) = delete;
 
     static page_heap& get_instance() {
-        //C++11 guarantee the thread-safety of static local variable's initialization
+        // C++11 guarantee the thread-safety of static local variable's initialization
         static page_heap instance;
         return instance;
     }
 
     span* allocate(size_t npage) {
-        assert(npage > 0);
+        // assert(npage > 0);
+        if(npage == 0) {
+            throw std::logic_error{"allocate zero page"};
+        }
 
         if(npage >= M) {
-            auto ptr = sys_alloc(npage << page_shift);
+            auto ptr = sys_alloc(npage << PAGE_SHIFT);
             auto res = span_pool.new_();
-            res->first_page = reinterpret_cast<uintptr_t>(ptr) >> page_shift;
+            res->first_page = reinterpret_cast<uintptr_t>(ptr) >> PAGE_SHIFT;
             res->page_count_ = npage;
-            page_to_span_.set(res->first_page, res);
-            page_to_span_.set(res->first_page + res->page_count_ - 1, res);
+            // page_to_span_.set(res->first_page, res);
+            // page_to_span_.set(res->first_page + res->page_count_ - 1, res);
+            for(size_t i = 0; i < res->page_count_; i++) {
+                page_to_span_.set(res->first_page + i, res);
+            }
             return res;
         }
 
         if(!freelists_[npage].empty()) {
             auto res = freelists_[npage].pop();
-            page_to_span_.set(res->first_page, res);
-            page_to_span_.set(res->first_page + res->page_count_ - 1, res);
+            // page_to_span_.set(res->first_page, res);
+            // page_to_span_.set(res->first_page + res->page_count_ - 1, res);
+            for(size_t i = 0; i < res->page_count_; i++) {
+                page_to_span_.set(res->first_page + i, res);
+            }
             return res;
         }
 
@@ -386,36 +423,46 @@ public:
                 res->page_count_ = npage;
                 t->page_count_ -= npage;
                 freelists_[t->page_count_].push(t);
-                page_to_span_.set(t->first_page, t);
-                page_to_span_.set(t->first_page + t->page_count_ - 1, t);
-                page_to_span_.set(res->first_page, res);
-                page_to_span_.set(res->first_page + res->page_count_ - 1, res);
+                // page_to_span_.set(t->first_page, t);
+                // page_to_span_.set(t->first_page + t->page_count_ - 1, t);
+                // page_to_span_.set(res->first_page, res);
+                // page_to_span_.set(res->first_page + res->page_count_ - 1, res);
+                for(size_t j = 0; j < t->page_count_; j++) {
+                    page_to_span_.set(t->first_page + j, t);
+                }
+                for(size_t j = 0; j < res->page_count_; j++) {
+                    page_to_span_.set(res->first_page + j, res);
+                }
                 return res;
             }
         }
 
-        //new a span with max num of pages and recurse to allocate the span of npage
+        // new a span with max num of pages and recurse to allocate the span of npage
         auto res = span_pool.new_();
-        auto ptr = sys_alloc((M - 1) << page_shift);
-        res->first_page = reinterpret_cast<uintptr_t>(ptr) >> page_shift;
+        auto ptr = sys_alloc((M - 1) << PAGE_SHIFT);
+        res->first_page = reinterpret_cast<uintptr_t>(ptr) >> PAGE_SHIFT;
         res->page_count_ = M - 1;
         freelists_[res->page_count_].push(res);
         return allocate(npage);
     }
 
     void deallocate(span* _span) {
-        assert(_span != nullptr);
+        // assert(_span != nullptr);
+        if(_span == nullptr) {
+            throw std::logic_error{"deallocate a nullptr"};
+        }
 
+        //memory too large to manage
         if(_span->page_count_ >= M) {
-            auto ptr = reinterpret_cast<void*>(_span->first_page << page_shift);
+            auto ptr = reinterpret_cast<void*>(_span->first_page << PAGE_SHIFT);
             sys_free(ptr);
             span_pool.delete_(_span);
             return;
         }
 
-        //merge forward
+        // merge forward
         while(true) {
-            auto prev_page = _span->first_page - 1; //the last page of prev_span
+            auto prev_page = _span->first_page - 1; // the last page of prev_span
             auto prev_span = page_to_span_.get(prev_page);
             if(prev_span == nullptr) {
                 break;
@@ -427,14 +474,14 @@ public:
             if(prev_span->page_count_ + _span->page_count_ >= M) {
                 break;
             }
-            _span->first_page = prev_span->first_page; //the first page of prev_span
+            _span->first_page = prev_span->first_page; // the first page of prev_span
             _span->page_count_ += prev_span->page_count_;
             freelists_[prev_span->page_count_].erase(prev_span);
             span_pool.delete_(prev_span);
         }
-        //merge backwards
+        // merge backwards
         while(true) {
-            auto next_page = _span->first_page + _span->page_count_; //the first page of next_span
+            auto next_page = _span->first_page + _span->page_count_; // the first page of next_span
             auto next_span = page_to_span_.get(next_page);
             if(next_span == nullptr) {
                 break;
@@ -452,14 +499,20 @@ public:
         }
         freelists_[_span->page_count_].push(_span);
         _span->alive_ = false;
-        page_to_span_.set(_span->first_page, _span);
-        page_to_span_.set(_span->first_page + _span->page_count_ - 1, _span);
+        // page_to_span_.set(_span->first_page, _span);
+        // page_to_span_.set(_span->first_page + _span->page_count_ - 1, _span);
+        for(size_t i = 0; i < _span->page_count_; i++) {
+            page_to_span_.set(_span->first_page + i, _span);
+        }
     }
 
     span* find_span(void* ptr) const {
-        auto page = reinterpret_cast<uintptr_t>(ptr) >> page_shift;
+        auto page = reinterpret_cast<uintptr_t>(ptr) >> PAGE_SHIFT;
         auto res = page_to_span_.get(page);
-        assert(res != nullptr);
+        // assert(res != nullptr);
+        if(res == nullptr) {
+            throw std::logic_error{"find span failed"};
+        }
         return res;
     }
 };
@@ -467,36 +520,44 @@ public:
 class mutex_span_list final : public span_list {
 public:
     using span_list::span_list;
-    mutable std::mutex mtx_; //mutex for every bucket
+    mutable std::mutex mtx_; // mutex for every bucket
 };
 
 class central_cache {
-    mutex_span_list freelists_[N]; //map size to mutex_span_list
+    mutex_span_list freelists_[N]; // map size to mutex_span_list
 
     central_cache() = default;
 
     span* fetch_from_page_cache(size_t index, size_t size) const {
-        assert(index < N);
+        // assert(index < N);
+        if(index >= N) {
+            throw std::out_of_range{"index out of range"};
+        }
+
         freelists_[index].mtx_.unlock();
 
         auto npage = helper::get_npage(size);
         page_heap::get_instance().mtx_.lock();
         auto _span = page_heap::get_instance().allocate(npage);
-        assert(_span != nullptr);
-        auto begin = reinterpret_cast<char*>(_span->first_page << page_shift);
-        auto end = begin + (npage << page_shift);
+        // assert(_span != nullptr);
+        if(_span == nullptr) {
+            throw std::logic_error{"page_heap alloc failed"};
+        }
+
+        auto begin = reinterpret_cast<char*>(_span->first_page << PAGE_SHIFT);
+        auto end = begin + (npage << PAGE_SHIFT);
         _span->alive_ = true;
         _span->size_ = size;
         page_heap::get_instance().mtx_.unlock();
 
-        //push back
-        _span->freelist_ = begin; //head
-        auto tail = begin;   //tail
-        begin += size;            //cur
-        while(begin != end) {
-            helper::next(tail) = begin;
-            tail = begin;
-            begin += size;
+        // push back
+        _span->freelist_ = begin; // head
+        auto tail = begin;        // tail
+        auto cur = begin;
+        while(cur + size < end) {
+            tail = cur;
+            cur += size;
+            helper::next(tail) = cur;
         }
         helper::next(tail) = nullptr;
 
@@ -510,13 +571,16 @@ public:
     central_cache& operator=(const central_cache&) = delete;
 
     static central_cache& get_instance() {
-        //C++11 guarantee the thread-safety of static local variable's initialization
+        // C++11 guarantee the thread-safety of static local variable's initialization
         static central_cache instance;
         return instance;
     }
 
     auto allocate(size_t index, size_t nblock, size_t size) const {
-        assert(index < N);
+        // assert(index < N);
+        if(index >= N) {
+            throw std::out_of_range{"index out of range"};
+        }
 
         freelists_[index].mtx_.lock();
         auto _span = freelists_[index].begin();
@@ -546,7 +610,11 @@ public:
 
     void deallocate(void* ptr, size_t size) const {
         auto index = helper::get_index(size);
-        assert(index < N);
+        // assert(index < N);
+        if(index >= N) {
+            throw std::out_of_range{"index out of range"};
+        }
+
         freelists_[index].mtx_.lock();
         while (ptr) {
             auto next = helper::next(ptr);
@@ -575,10 +643,13 @@ class thread_cache {
     struct mem_list {
         void* head_{};
         size_t length_{};
-        size_t max_length_{1}; //for slow start
+        size_t max_length_{1}; // for slow start
 
         void push(void* block) {
-            assert(block != nullptr);
+            // assert(block != nullptr);
+            if(block == nullptr) {
+                throw std::logic_error{"push a nullptr"};
+            }
 
             helper::next(block) = head_;
             head_ = block;
@@ -586,8 +657,11 @@ class thread_cache {
         }
 
         void push(void* first, void* last, size_t n) {
-            assert(first != nullptr);
-            assert(last != nullptr);
+            // assert(first != nullptr);
+            // assert(last != nullptr);
+            if(first == nullptr || last == nullptr) {
+                throw std::logic_error{"push null range"};
+            }
 
             helper::next(last) = head_;
             head_ = first;
@@ -595,7 +669,10 @@ class thread_cache {
         }
 
         void* pop() {
-            assert(!empty());
+            // assert(!empty());
+            if(empty()) {
+                throw std::logic_error{"pop from empty list"};
+            }
 
             auto res = head_;
             head_ = helper::next(head_);
@@ -604,7 +681,10 @@ class thread_cache {
         }
 
         auto pop(size_t n) {
-            assert(!empty());
+            // assert(!empty());
+            if(empty()) {
+                throw std::logic_error{"pop from empty list"};
+            }
 
             if(n > length_) {
                 n = length_;
@@ -625,12 +705,15 @@ class thread_cache {
         }
     };
 
-    mem_list freelists_[N]; //map size to mem_list
+    mem_list freelists_[N]; // map size to mem_list
 
     void* fetch_from_central_cache(size_t index, size_t size) {
-        assert(index < N);
+        // assert(index < N);
+        if(index >= N) {
+            throw std::out_of_range{"index out of range"};
+        }
 
-        //slow start algorithm
+        // slow start algorithm
         auto nblock = helper::get_nblock(size);
         if(nblock >= freelists_[index].max_length_) {
             nblock = freelists_[index].max_length_;
@@ -646,7 +729,10 @@ class thread_cache {
 
 public:
     void* allocate(size_t bytes) {
-        assert(bytes > 0 && bytes <= thread_cache_max_bytes);
+        // assert(bytes > 0 && bytes <= thread_cache_max_bytes);
+        if(bytes > thread_cache_max_bytes) {
+            throw std::out_of_range{"bytes out of range for thread cache"};
+        }
 
         auto size = helper::get_size(bytes);
         auto index = helper::get_index(bytes);
@@ -657,8 +743,14 @@ public:
     }
 
     void deallocate(void* ptr, size_t size) {
-        assert(ptr != nullptr);
-        assert(size > 0 && size <= thread_cache_max_bytes);
+        // assert(ptr != nullptr);
+        // assert(size > 0 && size <= thread_cache_max_bytes);
+        if(ptr == nullptr) {
+            throw std::logic_error{"deallocate a nullptr"};
+        }
+        if(size > thread_cache_max_bytes) {
+            throw std::out_of_range{"size out of range for thread cache"};
+        }
 
         auto index = helper::get_index(size);
         freelists_[index].push(ptr);
@@ -683,7 +775,7 @@ inline void* malloc(size_t bytes) {
         return {};
     }
 
-    using namespace mtmalloc_internal;
+    using namespace detail;
 
     if(bytes > thread_cache_max_bytes) {
         auto size = helper::get_size(bytes);
@@ -691,7 +783,7 @@ inline void* malloc(size_t bytes) {
         std::lock_guard<std::mutex> lock{page_heap::get_instance().mtx_};
         auto _span = page_heap::get_instance().allocate(npage);
         _span->size_ = size;
-        return reinterpret_cast<void*>(_span->first_page << page_shift);
+        return reinterpret_cast<void*>(_span->first_page << PAGE_SHIFT);
     }
 
     if(tc == nullptr) {
@@ -716,7 +808,7 @@ inline void free(void* ptr) {
         return;
     }
 
-    using namespace mtmalloc_internal;
+    using namespace detail;
 
     auto _span = page_heap::get_instance().find_span(ptr);
     auto size = _span->size_;
@@ -724,7 +816,11 @@ inline void free(void* ptr) {
         std::lock_guard<std::mutex> lock{page_heap::get_instance().mtx_};
         page_heap::get_instance().deallocate(_span);
     } else {
-        assert(tc != nullptr);
+        // assert(tc != nullptr);
+        if(tc == nullptr) {
+            throw std::logic_error{"thread cache have not created"};
+        }
+
         tc->deallocate(ptr, size);
     }
 }
