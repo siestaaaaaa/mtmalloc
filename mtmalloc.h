@@ -32,6 +32,7 @@ inline constexpr size_t N = 208; // num of the buckets of central_cache and thre
 inline constexpr size_t M = 129; // num of the buckets of page_heap
 inline constexpr size_t PAGE_SHIFT = 13; // page_size: 8KB
 
+
 // allocate memory from system
 inline void* sys_alloc(size_t size) {
 #if defined(_WIN32)
@@ -53,6 +54,7 @@ inline void* sys_alloc(size_t size) {
     return ptr;
 }
 
+
 // only used when memory is too large to manage
 inline void sys_free(void* ptr) {
 #if defined(_WIN32)
@@ -64,15 +66,8 @@ inline void sys_free(void* ptr) {
 #endif
 }
 
+
 class helper {
-    static size_t align(size_t bytes, size_t align_num) {
-        return (bytes + align_num - 1) & ~(align_num - 1);
-    }
-
-    static size_t index_in_group(size_t bytes, size_t align_shift) {
-        return ((bytes + (1 << align_shift) - 1) >> align_shift) - 1;
-    }
-
 public:
     // align bytes to size
     static size_t get_size(size_t bytes) {
@@ -144,21 +139,23 @@ public:
         }
         return *static_cast<void**>(block);
     }
+
+private:
+    static size_t align(size_t bytes, size_t align_num) {
+        return (bytes + align_num - 1) & ~(align_num - 1);
+    }
+
+    static size_t index_in_group(size_t bytes, size_t align_shift) {
+        return ((bytes + (1 << align_shift) - 1) >> align_shift) - 1;
+    }
 };
+
 
 // object pool is to allocate memory of fixed length
 template<typename T>
 class object_pool {
-    char* mem_{};           // large continuous memory
-    size_t bytes_{};        // remain bytes
-    void* freelist_{};      // manage free memory blocks
-
 public:
     object_pool() = default;
-
-    // not copyable and movable
-    object_pool(const object_pool&) = delete;
-    object_pool& operator=(const object_pool&) = delete;
 
     // new an object
     T* new_() {
@@ -194,7 +191,17 @@ public:
         helper::next(ptr) = freelist_;
         freelist_ = ptr;
     }
+
+    // not copyable and movable
+    object_pool(const object_pool&) = delete;
+    object_pool& operator=(const object_pool&) = delete;
+
+private:
+    char* mem_{};           // large continuous memory
+    size_t bytes_{};        // remain bytes
+    void* freelist_{};      // manage free memory blocks
 };
+
 
 // span is to manage the memory of contiguous pages
 struct span {
@@ -210,19 +217,16 @@ struct span {
     span* prev_{};          // prev span
 };
 
+
 inline object_pool<span> span_pool;
 
-class span_list {
-    span* head_{}; // dummy
 
+class span_list {
 public:
     span_list() {
         head_ = span_pool.new_();
         head_->next_ = head_->prev_ = head_;
     }
-    // not copyable and movable
-    span_list(const span_list&) = delete;
-    span_list& operator=(const span_list&) = delete;
 
     void push(span* node) const {
         // assert(node != nullptr);
@@ -275,7 +279,15 @@ public:
     [[nodiscard]] bool empty() const {
         return begin() == end();
     }
+
+    // not copyable and movable
+    span_list(const span_list&) = delete;
+    span_list& operator=(const span_list&) = delete;
+
+private:
+    span* head_{}; // dummy
 };
+
 
 // page_map contains a mapping from page to span
 // If span s occupies pages [p...q]
@@ -291,33 +303,8 @@ public:
 // and written while holding the page_heap's lock
 template<size_t Bits>
 class page_map {
-    static constexpr int leaf_bits = (Bits + 2) / 3;        // round up
-    static constexpr int leaf_length = 1 << leaf_bits;
-
-    static constexpr int node_bits = (Bits + 2) / 3;        // round up
-    static constexpr int node_length = 1 << node_bits;
-
-    static constexpr int root_bits = Bits - leaf_bits - node_bits;
-    static constexpr int root_length = 1 << root_bits;
-
-    struct leaf {
-        span* vals[leaf_length]{};
-    };
-    static inline object_pool<leaf> leaf_pool{};
-
-    struct node {
-        leaf* leafs[node_length]{};
-    };
-    static inline object_pool<node> node_pool{};
-
-    node* root_[root_length]{};
-
 public:
     page_map() = default;
-
-    // not copyable and movable
-    page_map(const page_map&) = delete;
-    page_map& operator=(const page_map&) = delete;
 
     [[nodiscard]] span* get(uintptr_t key) const {
         auto i1 = key >> (leaf_bits + node_bits);
@@ -362,23 +349,38 @@ public:
         }
         return true;
     }
+
+    // not copyable and movable
+    page_map(const page_map&) = delete;
+    page_map& operator=(const page_map&) = delete;
+
+private:
+    static constexpr int leaf_bits = (Bits + 2) / 3;        // round up
+    static constexpr int leaf_length = 1 << leaf_bits;
+
+    static constexpr int node_bits = (Bits + 2) / 3;        // round up
+    static constexpr int node_length = 1 << node_bits;
+
+    static constexpr int root_bits = Bits - leaf_bits - node_bits;
+    static constexpr int root_length = 1 << root_bits;
+
+    struct leaf {
+        span* vals[leaf_length]{};
+    };
+    static inline object_pool<leaf> leaf_pool{};
+
+    struct node {
+        leaf* leafs[node_length]{};
+    };
+    static inline object_pool<node> node_pool{};
+
+    node* root_[root_length]{};
 };
+
 
 // page_heap is to allocate and deallocate span
 class page_heap {
-    span_list freelists_[M]; // map page_count to span_list
-
-    static constexpr size_t Bits = (sizeof(void*) == 8 ? 48 : 32) - PAGE_SHIFT;
-    page_map<Bits> page_to_span_{};
-
-    page_heap() = default;
-
 public:
-    mutable std::mutex mtx_; // mutex for page_heap
-
-    page_heap(const page_heap&) = delete;
-    page_heap& operator=(const page_heap&) = delete;
-
     static page_heap& get_instance() {
         // C++11 guarantee the thread-safety of static local variable's initialization
         static page_heap instance;
@@ -515,7 +517,22 @@ public:
         }
         return res;
     }
+
+    page_heap(const page_heap&) = delete;
+    page_heap& operator=(const page_heap&) = delete;
+
+private:
+    span_list freelists_[M]; // map page_count to span_list
+
+    static constexpr size_t Bits = (sizeof(void*) == 8 ? 48 : 32) - PAGE_SHIFT;
+    page_map<Bits> page_to_span_{};
+
+    page_heap() = default;
+
+public:
+    mutable std::mutex mtx_; // mutex for page_heap
 };
+
 
 class mutex_span_list final : public span_list {
 public:
@@ -523,53 +540,9 @@ public:
     mutable std::mutex mtx_; // mutex for every bucket
 };
 
+
 class central_cache {
-    mutex_span_list freelists_[N]; // map size to mutex_span_list
-
-    central_cache() = default;
-
-    span* fetch_from_page_cache(size_t index, size_t size) const {
-        // assert(index < N);
-        if(index >= N) {
-            throw std::out_of_range{"index out of range"};
-        }
-
-        freelists_[index].mtx_.unlock();
-
-        auto npage = helper::get_npage(size);
-        page_heap::get_instance().mtx_.lock();
-        auto _span = page_heap::get_instance().allocate(npage);
-        // assert(_span != nullptr);
-        if(_span == nullptr) {
-            throw std::logic_error{"page_heap alloc failed"};
-        }
-
-        auto begin = reinterpret_cast<char*>(_span->first_page << PAGE_SHIFT);
-        auto end = begin + (npage << PAGE_SHIFT);
-        _span->alive_ = true;
-        _span->size_ = size;
-        page_heap::get_instance().mtx_.unlock();
-
-        // push back
-        _span->freelist_ = begin; // head
-        auto tail = begin;        // tail
-        auto cur = begin;
-        while(cur + size < end) {
-            tail = cur;
-            cur += size;
-            helper::next(tail) = cur;
-        }
-        helper::next(tail) = nullptr;
-
-        freelists_[index].mtx_.lock();
-        freelists_[index].push(_span);
-        return _span;
-    }
-
 public:
-    central_cache(const central_cache&) = delete;
-    central_cache& operator=(const central_cache&) = delete;
-
     static central_cache& get_instance() {
         // C++11 guarantee the thread-safety of static local variable's initialization
         static central_cache instance;
@@ -583,6 +556,7 @@ public:
         }
 
         freelists_[index].mtx_.lock();
+
         auto _span = freelists_[index].begin();
         while(_span != freelists_[index].end()) {
             if(_span->freelist_) {
@@ -593,7 +567,6 @@ public:
         if(_span->freelist_ == nullptr) {
             _span = fetch_from_page_cache(index, size);
         }
-
         auto first = _span->freelist_, last = first;
         size_t cnt = 1;
         while(cnt < nblock && helper::next(last)) {
@@ -604,7 +577,9 @@ public:
         helper::next(last) = nullptr;
 
         _span->use_count_ += cnt;
+
         freelists_[index].mtx_.unlock();
+
         return std::make_tuple(first, last, cnt);
     }
 
@@ -637,7 +612,55 @@ public:
         }
         freelists_[index].mtx_.unlock();
     }
+
+    central_cache(const central_cache&) = delete;
+    central_cache& operator=(const central_cache&) = delete;
+
+private:
+    span* fetch_from_page_cache(size_t index, size_t size) const {
+        freelists_[index].mtx_.unlock();
+
+        // assert(index < N);
+        if(index >= N) {
+            throw std::out_of_range{"index out of range"};
+        }
+
+        auto npage = helper::get_npage(size);
+        page_heap::get_instance().mtx_.lock();
+        auto _span = page_heap::get_instance().allocate(npage);
+        page_heap::get_instance().mtx_.unlock();
+
+        // assert(_span != nullptr);
+        if(_span == nullptr) {
+            throw std::logic_error{"page_heap alloc failed"};
+        }
+
+        auto begin = reinterpret_cast<char*>(_span->first_page << PAGE_SHIFT);
+        auto end = begin + (npage << PAGE_SHIFT);
+        _span->alive_ = true;
+        _span->size_ = size;
+
+        // push back
+        _span->freelist_ = begin; // head
+        auto tail = begin;   // tail
+        auto cur = begin;
+        while(cur + size < end) {
+            tail = cur;
+            cur += size;
+            helper::next(tail) = cur;
+        }
+        helper::next(tail) = nullptr;
+
+        freelists_[index].mtx_.lock();
+        freelists_[index].push(_span);
+        return _span;
+    }
+
+    mutex_span_list freelists_[N]; // map size to mutex_span_list
+
+    central_cache() = default;
 };
+
 
 class thread_cache {
     struct mem_list {
@@ -762,13 +785,13 @@ public:
     }
 };
 
+
 inline thread_local thread_cache* tc{};
-
 inline object_pool<thread_cache> thread_cache_pool;
-
 inline std::mutex thread_cache_pool_mtx;
 
 }
+
 
 inline void* malloc(size_t bytes) {
     if(bytes == 0) {
@@ -794,6 +817,7 @@ inline void* malloc(size_t bytes) {
     return tc->allocate(bytes);
 }
 
+
 inline void* calloc(size_t num, size_t bytes) {
     auto total = num * bytes;
     auto res = malloc(total);
@@ -802,6 +826,7 @@ inline void* calloc(size_t num, size_t bytes) {
     }
     return res;
 }
+
 
 inline void free(void* ptr) {
     if(ptr == nullptr) {
@@ -825,9 +850,11 @@ inline void free(void* ptr) {
     }
 }
 
+
 inline void* realloc(void *ptr, size_t new_bytes) {
     free(ptr);
     return malloc(new_bytes);
 }
+
 
 }
