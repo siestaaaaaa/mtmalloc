@@ -236,15 +236,9 @@ class ObjectPool final : public ThreadLocalSingleton<ObjectPool<T>> {
       res = static_cast<T*>(freeList_);
       freeList_ = next;
     } else {
-      if (bytes_ < sizeof(T)) {
-        bytes_ = 128 * 1024;
-        mem_ = static_cast<char*>(SysAlloc(bytes_));
-      }
-      res = reinterpret_cast<T*>(mem_);
-      auto stride = sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
-      mem_ += stride;
-      bytes_ -= stride;
+      res = static_cast<T*>(SysAlloc(sizeof(T)));
     }
+
     new (res) T{};
     return res;
   }
@@ -260,9 +254,6 @@ class ObjectPool final : public ThreadLocalSingleton<ObjectPool<T>> {
   }
 
  private:
-  char* mem_{};     // large continuous memory
-  size_t bytes_{};
-
   void* freeList_{};
 };
 
@@ -799,3 +790,4 @@ inline void* realloc(void* ptr, size_t new_bytes) {
 }  // namespace mtmalloc
 
 #endif
+
