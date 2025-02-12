@@ -1,5 +1,3 @@
-English | [中文](README-CN.md)
-
 # mtmalloc : multi-threaded malloc
 
 mtmalloc is a header-only, high-performance memory allocator designed specifically for multi-threaded C++ applications. It currently supports Windows and Linux environments.

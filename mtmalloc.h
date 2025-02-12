@@ -209,23 +209,23 @@ class Singleton {
 };
 
 template <typename T>
-class ThreadLocalSingleton {
+class ThreadSingleton {
  public:
   static T& getInstance() {
     static thread_local T instance;
     return instance;
   }
 
-  ThreadLocalSingleton(const ThreadLocalSingleton&) = delete;
-  ThreadLocalSingleton& operator=(const ThreadLocalSingleton&) = delete;
+  ThreadSingleton(const ThreadSingleton&) = delete;
+  ThreadSingleton& operator=(const ThreadSingleton&) = delete;
 
  protected:
-  ThreadLocalSingleton() = default;
+  ThreadSingleton() = default;
 };
 
 template <typename T>
-class ObjectPool final : public ThreadLocalSingleton<ObjectPool<T>> {
-  friend class ThreadLocalSingleton<ObjectPool<T>>;
+class ObjectPool final : public ThreadSingleton<ObjectPool<T>> {
+  friend class ThreadSingleton<ObjectPool<T>>;
   ObjectPool() = default;
 
  public:
