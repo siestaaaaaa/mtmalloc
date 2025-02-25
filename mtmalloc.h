@@ -77,7 +77,7 @@ inline void* SysAlloc(size_t size) {
 
 inline void SysFree(void* ptr, size_t size) {
 #if defined(_WIN32)
-  VirtualFree(ptr, size, MEM_RELEASE);
+  VirtualFree(ptr, 0, MEM_RELEASE);
 #elif defined(__linux__) || defined(linux)
   munmap(ptr, size);
 #else
@@ -93,7 +93,7 @@ struct Span {
 
   void* freeList_{};
   size_t size_{};  // ensure mtmalloc::free no need to know size
-  int useCount_{};
+  size_t useCount_{};
 
   bool isUsing_{};
 
@@ -187,7 +187,7 @@ class Helper {
   }
 
   static size_t indexInGroup(size_t bytes, size_t alignShift) {
-    return ((bytes + (1 << alignShift) - 1) >> alignShift) - 1;
+    return ((bytes + (size_t{1} << alignShift) - 1) >> alignShift) - 1;
   }
 };
 
@@ -565,7 +565,7 @@ class CentralCache final : public Singleton<CentralCache> {
       Helper::next(ptr) = span->freeList_;
       span->freeList_ = ptr;
 
-      if (--span->useCount_ <= 0) {
+      if (--span->useCount_ == 0) {
         freeLists_[index].erase(span);
         span->freeList_ = nullptr;
         span->next_ = nullptr;
