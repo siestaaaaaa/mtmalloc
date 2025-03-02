@@ -53,7 +53,7 @@ inline constexpr size_t MaxBucketNum = 208;
 // for page heap
 inline constexpr size_t MaxPageNum = 129;
 
-// assume page size >= 4KB
+// assume page size of OS >= 4KB
 inline constexpr size_t PageShift = 12;
 
 inline void* SysAlloc(size_t size) {
