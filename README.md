@@ -6,6 +6,35 @@ It's extremely easy to setup. Just include the **mtmalloc.h** file in your code!
 
 > Please ensure that your compiler supports C++17 or later standards, and use a compiler optimization level of O2 or higher.
 
+# Benchmark
+
+CPU: 12th Gen Intel(R) Core(TM) i7-12700H
+
+Memory: 16 GB
+
+OS: Ubuntu 22.04
+
+Compiler: g++ 13.3.0
+
+|  size  | threads | malloc | mtmalloc | malloc/mtmalloc |
+|:------:|:-------:|:------:|:--------:|:---------------:|
+| 0 ~ 32K|    1    | 17.5ns |  17.2ns  |      1.02       |
+| 0 ~ 32K|    4    | 30.3ns |  11.0ns  |      2.75       |
+| 0 ~ 32K|   16    | 46.7ns |  16.3ns  |      2.87       |
+| 0 ~ 32K|   64    | 54.3ns |  19.5ns  |      2.78       |
+| 0 ~ 64K|    1    | 34.5ns |  10.7ns  |      3.22       |
+| 0 ~ 64K|    4    | 34.3ns |  11.6ns  |      2.96       |
+| 0 ~ 64K|   16    | 50.5ns |  17.6ns  |      2.87       |
+| 0 ~ 64K|   64    | 57.5ns |  19.7ns  |      2.92       |
+|0 ~ 128K|    1    | 33.7ns |  14.2ns  |      2.37       |
+|0 ~ 128K|    4    | 33.4ns |  15.7ns  |      2.13       |
+|0 ~ 128K|   16    | 48.8ns |  21.4ns  |      2.28       |
+|0 ~ 128K|   64    | 53.7ns |  23.8ns  |      2.26       |
+|0 ~ 256K|    1    | 39.9ns |  12.1ns  |      3.30       |
+|0 ~ 256K|    4    | 35.1ns |  13.4ns  |      2.62       |
+|0 ~ 256K|   16    | 52.3ns |  19.1ns  |      2.74       |
+|0 ~ 256K|   64    | 54.4ns |  21.2ns  |      2.57       |
+
 # Introduction
 
 This project draws inspiration from TCMalloc and adopts a three-level cache structure, which effectively reduces lock contention and context switching during memory allocation in multi-threaded environments. The memory management within the project does not rely on the standard library but instead obtains memory through system calls. Memory released by users is preferentially managed within the caches to minimize the frequency of system calls. Each level of the cache uses open hashing to manage memory blocks of varying sizes and employs an object pool to accelerate metadata allocation.
@@ -26,7 +55,7 @@ For more information, you can refer to the source code.
 
 ## `malloc()`
 
-```
+```cpp
 void* malloc(size_t bytes);
 ```
 
@@ -36,7 +65,7 @@ Specially, `malloc(0)` returns `nullptr`.
 
 ## `calloc()`
 
-```
+```cpp
 void* calloc(size_t num, size_t bytes);
 ```
 
@@ -46,7 +75,7 @@ Specially, `calloc(num, 0)` or `calloc(0, bytes)` returns `nullptr`.
 
 ## `realloc()`
 
-```
+```cpp
 void* realloc(void *ptr, size_t new_bytes);
 ```
 
@@ -56,7 +85,7 @@ Specially, `realloc(ptr, 0)` will deallocate the memory pointed by `ptr` and ret
 
 ## `free()`
 
-```
+```cpp
 void free(void* ptr);
 ```
 
