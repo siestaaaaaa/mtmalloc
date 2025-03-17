@@ -32,11 +32,6 @@ node_modules/
 .DS_Store
 Thumbs.db
 
-*.cpp
-*.cc
-*.c
-*.in
-
 CMakeCache.txt
 CMakeLists.txt.cmake
 *.cmake
