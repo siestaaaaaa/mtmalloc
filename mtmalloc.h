@@ -45,16 +45,16 @@ namespace mtmalloc {
 
 namespace detail {
 
-inline constexpr size_t TCMaxSize = 256 * 1024;
+inline constexpr int kTCMaxSize = 256 * 1024;
 
 // for thread cache and central cache
-inline constexpr size_t MaxBucketNum = 208;
+inline constexpr int kMaxBucketNum = 208;
 
 // for page heap
-inline constexpr size_t MaxPageNum = 129;
+inline constexpr int kMaxPageNum = 129;
 
 // assume page size of OS >= 4KB
-inline constexpr size_t PageShift = 12;
+inline constexpr int kPageShift = 12;
 
 inline void* SysAlloc(size_t size) {
 #if defined(_WIN32)
@@ -75,7 +75,7 @@ inline void* SysAlloc(size_t size) {
   return ptr;
 }
 
-inline void SysFree(void* ptr, size_t size) {
+inline void SysFree(void* ptr, [[maybe_unused]] size_t size) {
 #if defined(_WIN32)
   VirtualFree(ptr, 0, MEM_RELEASE);
 #elif defined(__linux__) || defined(linux)
@@ -119,7 +119,7 @@ class Helper {
 
   // for thread cache and central cache
   static size_t bytesToIndex(size_t bytes) {
-    assert(bytes > 0 && bytes <= TCMaxSize);
+    assert(bytes > 0 && bytes <= kTCMaxSize);
 
     static int groups[4]{16, 56, 56, 56};
     if (bytes <= 128) {
@@ -131,18 +131,18 @@ class Helper {
     } else if (bytes <= 64 * 1024) {
       return indexInGroup(bytes - 8 * 1024, 10) + groups[2] + groups[1] +
              groups[0];
-    } else if (bytes <= 256 * 1024) {
+    } else if (bytes <= kTCMaxSize) {
       return indexInGroup(bytes - 64 * 1024, 13) + groups[3] + groups[2] +
              groups[1] + groups[0];
     } else {
-      return -1;
+      std::abort();
     }
   }
 
   static size_t sizeToBatch(size_t size) {
     assert(size > 0);
 
-    auto res = TCMaxSize / size;
+    auto res = kTCMaxSize / size;
     res = std::max(res, size_t{2});
     res = std::min(res, size_t{512});
     return res;
@@ -151,7 +151,7 @@ class Helper {
   static size_t sizeToPageNum(size_t size) {
     assert(size > 0);
 
-    auto res = (sizeToBatch(size) * size) >> PageShift;
+    auto res = (sizeToBatch(size) * size) >> kPageShift;
     res = std::max(res, size_t{1});
     return res;
   }
@@ -163,22 +163,22 @@ class Helper {
   }
 
   static uintptr_t addressToPageId(void* ptr) {
-    return reinterpret_cast<uintptr_t>(ptr) >> PageShift;
+    return reinterpret_cast<uintptr_t>(ptr) >> kPageShift;
   }
 
   static uintptr_t addressToPageOffset(void* ptr) {
     return reinterpret_cast<uintptr_t>(ptr) -
-           (addressToPageId(ptr) << PageShift);
+           (addressToPageId(ptr) << kPageShift);
   }
 
   static void* spanToBeginAddress(Span* span) {
-    return reinterpret_cast<void*>((span->firstPageId_ << PageShift) +
+    return reinterpret_cast<void*>((span->firstPageId_ << kPageShift) +
                                    span->firstPageOffset_);
   }
 
   static void* spanToEndAddress(Span* span) {
     return static_cast<char*>(spanToBeginAddress(span)) +
-           (span->pageCount_ << PageShift);
+           (span->pageCount_ << kPageShift);
   }
 
  private:
@@ -194,9 +194,8 @@ class Helper {
 template <typename T>
 class Singleton {
  public:
+  // thread-safe
   static T& getInstance() {
-    // C++11 guarantee the thread-safety of static local variable's
-    // initialization
     static T instance;
     return instance;
   }
@@ -209,67 +208,65 @@ class Singleton {
 };
 
 template <typename T>
-class ThreadSingleton {
- public:
-  static T& getInstance() {
-    static thread_local T instance;
-    return instance;
+class ObjectPool final : public Singleton<ObjectPool<T>> {
+  friend class Singleton<ObjectPool<T>>;
+
+  ObjectPool() {
+    auto mem = static_cast<T*>(SysAlloc(sizeof(T) * kInitSize));
+    for(int i = 0; i < kInitSize; i++, mem++) {
+      Helper::next(mem) = freeList_;
+      freeList_ = mem;
+    }
   }
 
-  ThreadSingleton(const ThreadSingleton&) = delete;
-  ThreadSingleton& operator=(const ThreadSingleton&) = delete;
-
- protected:
-  ThreadSingleton() = default;
-};
-
-template <typename T>
-class ObjectPool final : public ThreadSingleton<ObjectPool<T>> {
-  friend class ThreadSingleton<ObjectPool<T>>;
-  ObjectPool() = default;
-
  public:
-  T* new_() {
+  T* acquire() {
     T* res{};
-    if (freeList_) {
-      auto next = Helper::next(freeList_);
-      res = static_cast<T*>(freeList_);
-      freeList_ = next;
-    } else {
-      res = static_cast<T*>(SysAlloc(sizeof(T)));
+    {
+      std::lock_guard<std::mutex> lock{mtx_};
+      if (freeList_) {
+        auto next = Helper::next(freeList_);
+        res = static_cast<T*>(freeList_);
+        freeList_ = next;
+      } else {
+        res = static_cast<T*>(SysAlloc(sizeof(T)));
+      }
     }
-
     new (res) T{};
     return res;
   }
 
-  void delete_(T* ptr) {
+  void release(T* ptr) {
     if (ptr == nullptr) {
       return;
     }
     ptr->~T();
 
+    std::lock_guard<std::mutex> lock{mtx_};
     Helper::next(ptr) = freeList_;
     freeList_ = ptr;
   }
 
  private:
+  static constexpr int kInitSize = 64;
   void* freeList_{};
+  mutable std::mutex mtx_;
 };
 
-// PageMap contains a mapping from page to Span
-// PageMap can be read without lock and written while holding PageHeap's lock
-template <size_t Bits>
-class PageMap final : public Singleton<PageMap<Bits>> {
-  friend class Singleton<PageMap<Bits>>;
+// Contains a mapping from page to Span
+// PageMap::get can be called without lock
+// PageMap::set should be called while holding PageHeap's lock
+template <int kBits>
+class PageMap final : public Singleton<PageMap<kBits>> {
+  friend class Singleton<PageMap<kBits>>;
   PageMap() = default;
 
  public:
   [[nodiscard]] Span* get(uintptr_t key) const {
-    auto i1 = key >> (leafBits + nodeBits);
-    auto i2 = (key >> leafBits) & (nodeLength - 1);
-    auto i3 = key & (leafLength - 1);
-    if ((key >> Bits) > 0 || root_[i1] == nullptr ||
+    auto i1 = key >> (kLeafBits + kNodeBits);
+    auto i2 = (key >> kLeafBits) & (kNodeLength - 1);
+    auto i3 = key & (kLeafLength - 1);
+    if ((key >> kBits) > 0 || root_[i1] == nullptr ||
         root_[i1]->leafs_[i2] == nullptr) {
       return nullptr;
     }
@@ -279,60 +276,61 @@ class PageMap final : public Singleton<PageMap<Bits>> {
   // pop span: must set every page
   // push span: set first and last page is ok
   void set(uintptr_t key, Span* val) {
-    assert((key >> Bits) == 0);
+    assert((key >> kBits) == 0);
 
     ensure(key, 1);
-    auto i1 = key >> (leafBits + nodeBits);
-    auto i2 = (key >> leafBits) & (nodeLength - 1);
-    auto i3 = key & (leafLength - 1);
+    auto i1 = key >> (kLeafBits + kNodeBits);
+    auto i2 = (key >> kLeafBits) & (kNodeLength - 1);
+    auto i3 = key & (kLeafLength - 1);
     root_[i1]->leafs_[i2]->vals_[i3] = val;
   }
 
+ private:
   bool ensure(uintptr_t start, size_t n) {
-    for (auto key = start; key < start + n;) {
-      if ((key >> Bits) > 0) {
+    auto key = start;
+    while (key < start + n) {
+      if ((key >> kBits) > 0) {
         return false;
       }
-      auto i1 = key >> (leafBits + nodeBits);
-      auto i2 = (key >> leafBits) & (nodeLength - 1);
-      if (i1 >= rootLength) {
+      auto i1 = key >> (kLeafBits + kNodeBits);
+      auto i2 = (key >> kLeafBits) & (kNodeLength - 1);
+      if (i1 >= kRootLength) {
         return false;
       }
       if (root_[i1] == nullptr) {
-        root_[i1] = ObjectPool<Node>::getInstance().new_();
+        root_[i1] = ObjectPool<Node>::getInstance().acquire();
       }
       if (root_[i1]->leafs_[i2] == nullptr) {
-        root_[i1]->leafs_[i2] = ObjectPool<Leaf>::getInstance().new_();
+        root_[i1]->leafs_[i2] = ObjectPool<Leaf>::getInstance().acquire();
       }
-      key = ((key >> leafBits) + 1) << leafBits;
+      key = ((key >> kLeafBits) + 1) << kLeafBits;
     }
     return true;
   }
 
- private:
-  static constexpr int leafBits = (Bits + 2) / 3;  // round up
-  static constexpr int leafLength = 1 << leafBits;
-  static constexpr int nodeBits = (Bits + 2) / 3;  // round up
-  static constexpr int nodeLength = 1 << nodeBits;
-  static constexpr int rootBits = Bits - leafBits - nodeBits;
-  static constexpr int rootLength = 1 << rootBits;
+  static constexpr int kLeafBits = (kBits + 2) / 3;  // round up
+  static constexpr int kLeafLength = 1 << kLeafBits;
+  static constexpr int kNodeBits = (kBits + 2) / 3;  // round up
+  static constexpr int kNodeLength = 1 << kNodeBits;
+  static constexpr int kRootBits = kBits - kLeafBits - kNodeBits;
+  static constexpr int kRootLength = 1 << kRootBits;
 
   struct Leaf {
-    Span* vals_[leafLength]{};
+    Span* vals_[kLeafLength]{};
   };
 
   struct Node {
-    Leaf* leafs_[nodeLength]{};
+    Leaf* leafs_[kNodeLength]{};
   };
 
-  Node* root_[rootLength]{};
+  Node* root_[kRootLength]{};
 };
 
 // A double-list for Span without storing size
 class SpanList {
  public:
   SpanList() {
-    dummy_ = ObjectPool<Span>::getInstance().new_();
+    dummy_ = ObjectPool<Span>::getInstance().acquire();
     dummy_->next_ = dummy_->prev_ = dummy_;
   }
 
@@ -388,14 +386,14 @@ class PageHeap final : public Singleton<PageHeap> {
   Span* allocate(size_t pageNum) {
     assert(pageNum > 0);
 
-    if (pageNum >= MaxPageNum) {
-      auto ptr = SysAlloc(pageNum << PageShift);
-      auto res = ObjectPool<Span>::getInstance().new_();
+    if (pageNum >= kMaxPageNum) {
+      auto ptr = SysAlloc(pageNum << kPageShift);
+      auto res = ObjectPool<Span>::getInstance().acquire();
       res->firstPageId_ = Helper::addressToPageId(ptr);
       res->firstPageOffset_ = Helper::addressToPageOffset(ptr);
       res->pageCount_ = pageNum;
       for (size_t i = 0; i < res->pageCount_; i++) {
-        PageMap<Bits>::getInstance().set(res->firstPageId_ + i, res);
+        PageMap<kBits>::getInstance().set(res->firstPageId_ + i, res);
       }
       return res;
     }
@@ -403,39 +401,39 @@ class PageHeap final : public Singleton<PageHeap> {
     if (!freeLists_[pageNum].empty()) {
       auto res = freeLists_[pageNum].pop();
       for (size_t i = 0; i < res->pageCount_; i++) {
-        PageMap<Bits>::getInstance().set(res->firstPageId_ + i, res);
+        PageMap<kBits>::getInstance().set(res->firstPageId_ + i, res);
       }
       return res;
     }
 
-    for (auto i = pageNum + 1; i < MaxPageNum; i++) {
+    for (auto i = pageNum + 1; i < kMaxPageNum; i++) {
       if (!freeLists_[i].empty()) {
         auto t = freeLists_[i].pop();
 
-        auto res = ObjectPool<Span>::getInstance().new_();
+        auto res = ObjectPool<Span>::getInstance().acquire();
         res->firstPageId_ = t->firstPageId_;
         res->firstPageOffset_ = t->firstPageOffset_;
         res->pageCount_ = pageNum;
         for (size_t j = 0; j < res->pageCount_; j++) {
-          PageMap<Bits>::getInstance().set(res->firstPageId_ + j, res);
+          PageMap<kBits>::getInstance().set(res->firstPageId_ + j, res);
         }
 
         t->firstPageId_ += pageNum;
         t->pageCount_ -= pageNum;
         freeLists_[t->pageCount_].push(t);
-        PageMap<Bits>::getInstance().set(t->firstPageId_, t);
-        PageMap<Bits>::getInstance().set(t->firstPageId_ + t->pageCount_ - 1,
+        PageMap<kBits>::getInstance().set(t->firstPageId_, t);
+        PageMap<kBits>::getInstance().set(t->firstPageId_ + t->pageCount_ - 1,
                                          t);
         return res;
       }
     }
 
     // new a big Span
-    auto res = ObjectPool<Span>::getInstance().new_();
-    auto ptr = SysAlloc((MaxPageNum - 1) << PageShift);
+    auto res = ObjectPool<Span>::getInstance().acquire();
+    auto ptr = SysAlloc((kMaxPageNum - 1) << kPageShift);
     res->firstPageId_ = Helper::addressToPageId(ptr);
     res->firstPageOffset_ = Helper::addressToPageOffset(ptr);
-    res->pageCount_ = MaxPageNum - 1;
+    res->pageCount_ = kMaxPageNum - 1;
     freeLists_[res->pageCount_].push(res);
     return allocate(pageNum);
   }
@@ -444,16 +442,16 @@ class PageHeap final : public Singleton<PageHeap> {
   void deallocate(Span* span) {
     assert(span != nullptr);
 
-    if (span->pageCount_ >= MaxPageNum) {
+    if (span->pageCount_ >= kMaxPageNum) {
       auto ptr = Helper::spanToBeginAddress(span);
-      SysFree(ptr, span->pageCount_ << PageShift);
-      ObjectPool<Span>::getInstance().delete_(span);
+      SysFree(ptr, span->pageCount_ << kPageShift);
+      ObjectPool<Span>::getInstance().release(span);
       return;
     }
 
     while (true) {
       auto prevPageId = span->firstPageId_ - 1;
-      auto prevSpan = PageMap<Bits>::getInstance().get(prevPageId);
+      auto prevSpan = PageMap<kBits>::getInstance().get(prevPageId);
       if (prevSpan == nullptr) {
         break;
       }
@@ -463,17 +461,17 @@ class PageHeap final : public Singleton<PageHeap> {
       if (prevSpan->firstPageOffset_ != span->firstPageOffset_) {
         break;
       }
-      if (prevSpan->pageCount_ + span->pageCount_ >= MaxPageNum) {
+      if (prevSpan->pageCount_ + span->pageCount_ >= kMaxPageNum) {
         break;
       }
       span->firstPageId_ = prevSpan->firstPageId_;
       span->pageCount_ += prevSpan->pageCount_;
       freeLists_[prevSpan->pageCount_].erase(prevSpan);
-      ObjectPool<Span>::getInstance().delete_(prevSpan);
+      ObjectPool<Span>::getInstance().release(prevSpan);
     }
     while (true) {
       auto nextPageId = span->firstPageId_ + span->pageCount_;
-      auto nextSpan = PageMap<Bits>::getInstance().get(nextPageId);
+      auto nextSpan = PageMap<kBits>::getInstance().get(nextPageId);
       if (nextSpan == nullptr) {
         break;
       }
@@ -483,31 +481,31 @@ class PageHeap final : public Singleton<PageHeap> {
       if (nextSpan->firstPageOffset_ != span->firstPageOffset_) {
         break;
       }
-      if (nextSpan->pageCount_ + span->pageCount_ >= MaxPageNum) {
+      if (nextSpan->pageCount_ + span->pageCount_ >= kMaxPageNum) {
         break;
       }
       span->pageCount_ += nextSpan->pageCount_;
       freeLists_[nextSpan->pageCount_].erase(nextSpan);
-      ObjectPool<Span>::getInstance().delete_(nextSpan);
+      ObjectPool<Span>::getInstance().release(nextSpan);
     }
 
     span->isUsing_ = false;
     freeLists_[span->pageCount_].push(span);
-    PageMap<Bits>::getInstance().set(span->firstPageId_, span);
-    PageMap<Bits>::getInstance().set(span->firstPageId_ + span->pageCount_ - 1,
+    PageMap<kBits>::getInstance().set(span->firstPageId_, span);
+    PageMap<kBits>::getInstance().set(span->firstPageId_ + span->pageCount_ - 1,
                                      span);
   }
 
   Span* findSpan(void* ptr) const {
     auto pageId = Helper::addressToPageId(ptr);
-    auto res = PageMap<Bits>::getInstance().get(pageId);
+    auto res = PageMap<kBits>::getInstance().get(pageId);
     assert(res != nullptr);
     return res;
   }
 
  private:
-  SpanList freeLists_[MaxPageNum]; // index is pageNum
-  static constexpr size_t Bits = (sizeof(void*) == 8 ? 48 : 32) - PageShift;
+  SpanList freeLists_[kMaxPageNum]; // index is pageNum
+  static constexpr int kBits = (sizeof(void*) == 8 ? 48 : 32) - kPageShift;
 
  public:
   mutable std::mutex mtx_;
@@ -525,7 +523,7 @@ class CentralCache final : public Singleton<CentralCache> {
 
  public:
   auto allocate(size_t index, size_t batch, size_t size) const {
-    assert(index < MaxBucketNum);
+    assert(index < kMaxBucketNum);
 
     std::lock_guard<std::mutex> bucketLock{freeLists_[index].mtx_};
 
@@ -555,7 +553,7 @@ class CentralCache final : public Singleton<CentralCache> {
 
   void deallocate(void* ptr, size_t size) const {
     auto index = Helper::bytesToIndex(size);
-    assert(index < MaxBucketNum);
+    assert(index < kMaxBucketNum);
 
     std::unique_lock<std::mutex> bucketLock{freeLists_[index].mtx_};
     while (ptr) {
@@ -588,7 +586,7 @@ class CentralCache final : public Singleton<CentralCache> {
   Span* fetchFromPageCache(size_t index, size_t size) const {
     freeLists_[index].mtx_.unlock();
 
-    assert(index < MaxBucketNum);
+    assert(index < kMaxBucketNum);
 
     auto pageNum = Helper::sizeToPageNum(size);
     std::unique_lock<std::mutex> pageHeapLock{PageHeap::getInstance().mtx_};
@@ -619,7 +617,7 @@ class CentralCache final : public Singleton<CentralCache> {
   }
 
  private:
-  MutexSpanList freeLists_[MaxBucketNum]; // index is size
+  MutexSpanList freeLists_[kMaxBucketNum]; // index is size
 };
 
 // A special double-list for memblock
@@ -676,7 +674,7 @@ class TCList {
 class ThreadCache {
  public:
   void* allocate(size_t bytes) {
-    assert(bytes > 0 && bytes <= TCMaxSize);
+    assert(bytes > 0 && bytes <= kTCMaxSize);
 
     auto size = Helper::bytesToSize(bytes);
     auto index = Helper::bytesToIndex(bytes);
@@ -688,7 +686,7 @@ class ThreadCache {
 
   void deallocate(void* ptr, size_t size) {
     assert(ptr != nullptr);
-    assert(size > 0 && size <= TCMaxSize);
+    assert(size > 0 && size <= kTCMaxSize);
 
     auto index = Helper::bytesToIndex(size);
     freeLists_[index].push(ptr);
@@ -701,7 +699,7 @@ class ThreadCache {
 
  private:
   void* fetchFromCentralCache(size_t index, size_t size) {
-    assert(index < MaxBucketNum);
+    assert(index < kMaxBucketNum);
 
     // slow-start
     auto batch = Helper::sizeToBatch(size);
@@ -719,10 +717,10 @@ class ThreadCache {
   }
 
  private:
-  TCList freeLists_[MaxBucketNum]; // index is size
+  TCList freeLists_[kMaxBucketNum]; // index is size
 };
 
-inline thread_local ThreadCache* tc{};
+inline thread_local ThreadCache threadCache;
 
 }  // namespace detail
 
@@ -737,7 +735,7 @@ inline void* malloc(size_t bytes) {
 
   using namespace detail;
 
-  if (bytes > TCMaxSize) {
+  if (bytes > kTCMaxSize) {
     // allocate from page heap
     auto size = Helper::bytesToSize(bytes);
     auto pageNum = Helper::sizeToPageNum(size);
@@ -748,10 +746,7 @@ inline void* malloc(size_t bytes) {
   }
 
   // allocate from thread cache
-  if (tc == nullptr) {
-    tc = ObjectPool<ThreadCache>::getInstance().new_();
-  }
-  return tc->allocate(bytes);
+  return threadCache.allocate(bytes);
 }
 
 inline void* calloc(size_t num, size_t bytes) {
@@ -772,13 +767,13 @@ inline void free(void* ptr) {
   auto span = PageHeap::getInstance().findSpan(ptr);
   auto size = span->size_;
 
-  if (size > TCMaxSize) {
+  if (size > kTCMaxSize) {
     // deallocate to page heap
     std::lock_guard<std::mutex> pageHeapLock{PageHeap::getInstance().mtx_};
     PageHeap::getInstance().deallocate(span);
   } else {
     // deallocate to thread cache
-    tc->deallocate(ptr, size);
+    threadCache.deallocate(ptr, size);
   }
 }
 
@@ -790,4 +785,3 @@ inline void* realloc(void* ptr, size_t new_bytes) {
 }  // namespace mtmalloc
 
 #endif
-

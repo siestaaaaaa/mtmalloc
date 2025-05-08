@@ -7,7 +7,7 @@
 #include "mtmalloc.h"
 
 void mtmalloc_benchmark(benchmark::State& state) {
-  const int max_size = state.range(0);
+  const auto max_size = state.range(0);
   std::mt19937 rng(std::random_device{}());
   std::uniform_int_distribution<size_t> size_dist(1, max_size);
 
@@ -19,7 +19,7 @@ void mtmalloc_benchmark(benchmark::State& state) {
 }
 
 BENCHMARK(mtmalloc_benchmark)
-    ->Iterations(1e6)
+    ->Iterations(1000000)
     ->Args({32 * 1024})
     ->Args({64 * 1024})
     ->Args({128 * 1024})
