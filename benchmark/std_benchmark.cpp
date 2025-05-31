@@ -5,15 +5,15 @@
 #include <vector>
 
 void stdmalloc_benchmark(benchmark::State& state) {
-  const auto max_size = state.range(0);
-  std::mt19937 rng(std::random_device{}());
-  std::uniform_int_distribution<size_t> size_dist(0, max_size);
+    const auto max_size = state.range(0);
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<size_t> size_dist(0, max_size);
 
-  for (auto _ : state) {
-    void* ptr = std::malloc(size_dist(rng));
-    benchmark::DoNotOptimize(ptr);
-    std::free(ptr);
-  }
+    for (auto _ : state) {
+        void* ptr = std::malloc(size_dist(rng));
+        benchmark::DoNotOptimize(ptr);
+        std::free(ptr);
+    }
 }
 
 BENCHMARK(stdmalloc_benchmark)
