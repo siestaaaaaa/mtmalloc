@@ -14,10 +14,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstdint>
 #include <cstring>
 #include <forward_list>
-#include <memory>
 #include <mutex>
 
 #if defined(_WIN32)
@@ -138,10 +136,22 @@ public:
     }
 
     // Push one linked nodes at front
-    void pushNode(MemBlock node) { pushList(node, node, 1); }
+    void pushNode(MemBlock node) {
+        assert(node.addr() != nullptr);
+        node.setNext(head_);
+        head_ = node;
+        ++length_;
+    }
 
     // Pop one linked nodes at front
-    MemBlock popNode() { return popList(1).first; }
+    MemBlock popNode() {
+        assert(!empty());
+        MemBlock res = head_;
+        head_ = head_.getNext();
+        res.setNext(nullptr);
+        --length_;
+        return res;
+    }
 
     bool empty() { return length_ == 0; }
 
@@ -244,7 +254,10 @@ private:
     static T instance;
 };
 
-// An obj-pool for Span, RadixTreeV3::Node, RadixTreeV3::Leaf
+template <typename T>
+inline T Singleton<T>::instance{};
+
+// An obj-pool for Span, RadixTreeV3::Node2, RadixTreeV3::Node3
 // Should be accessed while holding PageHeap's lock
 template <typename T>
 class ObjectPool : public Singleton<ObjectPool<T>> {
@@ -264,7 +277,7 @@ public:
         }
     }
 
-    // Acquire mem from pool and construct obj with args
+    // Acquire mem and construct obj
     template <typename... Args>
     T* acquire(Args&&... args) {
         if (memPool_.empty()) {
@@ -275,7 +288,7 @@ public:
         return res;
     }
 
-    // Destruct obj and release mem to pool
+    // Destruct obj and release mem
     void release(T* ptr) {
         if (ptr == nullptr) [[unlikely]] {
             return;
@@ -295,7 +308,7 @@ private:
     RadixTreeV3() = default;
 
 private:
-    // Here assume VA_BITS = 64/32, PAGE_SIZE >= 4KB
+    // Here assume VA_BITS is 64 or 32, PAGE_SIZE >= 4KB
     // PageID_BITS = kBits1 + kBits2 + kBits3
     static constexpr int kPageID_Bits = (sizeof(void*) == 8 ? 52 : 20);
     static constexpr int kBits3 = (kPageID_Bits + 2) / 3;
@@ -319,7 +332,7 @@ private:
     Node1* root_ = new Node1;
 
 public:
-    // Find the span the page lies in, return nullptr if not found
+    // Find span that the page lies in, return nullptr if not found
     Span* search(size_t pageID) {
         assert((pageID >> kPageID_Bits) == 0);
 
@@ -327,7 +340,7 @@ public:
         size_t i2 = (pageID >> kBits3) & (kMax2 - 1);
         size_t i3 = pageID & (kMax3 - 1);
         if (root_->child_[i1] == nullptr ||
-            root_->child_[i1]->child_[i2] == nullptr) [[unlikely]] {
+            root_->child_[i1]->child_[i2] == nullptr) {
             return nullptr;
         }
         return root_->child_[i1]->child_[i2]->child_[i3];
@@ -355,9 +368,8 @@ private:
             if (root_->child_[i1] == nullptr) {
                 root_->child_[i1] = ObjectPool<Node2>::getInstance().acquire();
             }
-            if (root_->child_[i1]->child_[i2] == nullptr) [[likely]] {
-                root_->child_[i1]->child_[i2] =
-                    ObjectPool<Node3>::getInstance().acquire();
+            if (root_->child_[i1]->child_[i2] == nullptr) {
+                root_->child_[i1]->child_[i2] = ObjectPool<Node3>::getInstance().acquire();
             }
             curPageID = ((curPageID >> kBits3) + 1) << kBits3;
         }
@@ -365,6 +377,7 @@ private:
 };
 
 // Handle byte alignment, hash rules and batch request
+// TODO: change to platform-driven
 class SizeHandler {
 public:
     SizeHandler(size_t bytes) : size_{align(bytes)} {}
@@ -373,6 +386,7 @@ public:
     size_t getSize() { return size_; }
 
     // Get the hash index of ThreadCache and CentralCache (1~207)
+    // TODO: OPT
     size_t getCacheIndex() {
         if (cacheIndex_ != -1) [[likely]] {
             return cacheIndex_;
@@ -425,18 +439,22 @@ private:
     }
 
 public:
-    // TODO: Change to platform-driven configure
-
     /*Configure Segment Begin*/
 
-    // Configure the max size of an alloc request that ThreadCache can handle
+    // The max size of a request that ThreadCache can handle
     static constexpr size_t kTCMaxSize = 256 * 1024;
 
-    static constexpr size_t kMaxCacheIndex = 208;
+    static constexpr size_t kMaxCacheIndex = 207;
 
-    static constexpr size_t kMaxHeapIndex = 129;
+    static constexpr size_t kMaxHeapIndex = 128;
 
-    // Configure align rules
+    // Configure align rules:
+    //     0~127B - 8B
+    //     128~1023B - 16B
+    //     1024~8091B - 128B
+    //     8092~65535B - 1024B
+    //     >=65536B - 8092B
+    
     struct AlignConfig {
         const size_t minSize;
         const size_t alignNum;
@@ -447,7 +465,8 @@ public:
         {8 * 1024, 1024},
         {1024, 128},
         {128, 16},
-        {0, 8}};
+        {0, 8}
+    };
 
     // Configure cache hash rules
     struct CacheIndexConfig {
@@ -460,7 +479,8 @@ public:
         {8 * 1024, 1024, 128},
         {1024, 128, 72},
         {128, 16, 16},
-        {0, 8, 0}};
+        {0, 8, 0}
+    };
 
     /*Configure Segment End*/
 
@@ -478,12 +498,12 @@ private:
     PageHeap() = default;
 
 public:
-    // Acquire a span which contains sufficient memory
+    // Acquire a span that contains sufficient memory
     // Should be called while holding PageHeap's lock
     Span* acquire(SizeHandler& sizeHandler) {
         const size_t bucketIndex = sizeHandler.getHeapIndex();
 
-        // Special case, only called by ::mtmalloc::malloc
+        // Special case, only called by malloc
         if (bucketIndex >= kMaxBuckets) {
             return OutOfIndexAcquire(bucketIndex);
         }
@@ -517,11 +537,14 @@ public:
             }
         }
 
-        // Not found fit span, new a maxSpan and recursion to acquire
+        // Not found fit span, new a maxSpan and acquire again
         const size_t pagesToAlloc = kMaxBuckets - 1;
         void* addr = System::allocate(pagesToAlloc * System::kPageSize);
+        const size_t pageID = getPageID(addr);
+        const size_t pageOffset = 
+            reinterpret_cast<size_t>(addr) - (pageID * System::kPageSize);
         Span* maxSpan = ObjectPool<Span>::getInstance().acquire(
-            getPageID(addr), getPageOffset(addr), pagesToAlloc);
+            pageID, pageOffset, pagesToAlloc);
         spanBuckets_[pagesToAlloc].push_front(maxSpan);
         return acquire(sizeHandler);
     }
@@ -531,7 +554,7 @@ public:
     void release(Span* span) {
         const size_t bucketIndex = span->getTotalPageNum();
 
-        // Special case, only called by ::mtmalloc::free
+        // Special case, only called by free
         if (bucketIndex >= kMaxBuckets) {
             return OutOfIndexRelease(span);
         }
@@ -586,8 +609,8 @@ public:
     }
 
     // Find addr's owner span, abort if not found
-    static Span* findSpan(void* addr) {  // TEST: data race and overhead if lock
-        // addr -> pageID -> span
+    // TODO: test data race
+    static Span* findSpan(void* addr) {
         size_t pageID = getPageID(addr);
         Span* res = RadixTreeV3::getInstance().search(pageID);
         if (res == nullptr) [[unlikely]] {
@@ -617,16 +640,15 @@ private:
     static size_t getPageID(void* addr) {
         return reinterpret_cast<size_t>(addr) / System::kPageSize;
     }
-    static size_t getPageOffset(void* addr) {
-        return reinterpret_cast<size_t>(addr) -
-               (getPageID(addr) * System::kPageSize);
-    }
 
     static Span* OutOfIndexAcquire(const size_t bucketIndex) {
         void* addr = System::allocate(bucketIndex * System::kPageSize);
+        const size_t pageID = getPageID(addr);
+        const size_t pageOffset = 
+            reinterpret_cast<size_t>(addr) - (pageID * System::kPageSize);
         Span* res = ObjectPool<Span>::getInstance().acquire(
-            getPageID(addr), getPageOffset(addr), bucketIndex);
-        RadixTreeV3::getInstance().insert(getPageID(addr), res);
+            pageID, pageOffset, bucketIndex);
+        RadixTreeV3::getInstance().insert(pageID, res);
         return res;
     }
 
@@ -637,7 +659,7 @@ private:
     }
 
 private:
-    static constexpr size_t kMaxBuckets = SizeHandler::kMaxHeapIndex;
+    static constexpr size_t kMaxBuckets = SizeHandler::kMaxHeapIndex + 1;
     std::forward_list<Span*> spanBuckets_[kMaxBuckets];
 
 public:
@@ -651,8 +673,8 @@ private:
     CentralCache() = default;
 
 public:
-    // Try to acquire a batch of memblocks specifyed by fixedBatchNum
-    auto acquire(SizeHandler& sizeHandler, size_t fixedBatchNum) {
+    // Try to acquire a batch of memblocks
+    auto acquire(SizeHandler& sizeHandler, size_t expectedNum) {
         size_t index = sizeHandler.getCacheIndex();
         auto&& bucket = spanBuckets_[index];
 
@@ -671,14 +693,13 @@ public:
             bucket.push_front(span);
         }
 
-        // pop n slices from this span
         auto&& sliceList = span->sliceList_;
-        size_t n = std::min(sliceList.length(), fixedBatchNum);
-        auto [head, tail] = sliceList.popList(n);
+        size_t actualNum = std::min(sliceList.length(), expectedNum);
+        auto [head, tail] = sliceList.popList(actualNum);
 
         // mark these slices active
-        span->activeSlices_ += n;
-        return std::make_tuple(head, tail, n);
+        span->activeSlices_ += actualNum;
+        return std::make_tuple(head, tail, actualNum);
     }
 
     // Release a list of memblocks to their spans
@@ -712,10 +733,8 @@ public:
     }
 
 private:
-    // Fetch one span from PageHeap, slice and return
+    // Fetch a span from PageHeap and slice it
     Span* fetchFromPageHeap(SizeHandler& sizeHandler) {
-        assert(sizeHandler.getHeapIndex() < SizeHandler::kMaxHeapIndex);
-
         Span* span{};
         {
             std::lock_guard<std::mutex> pageHeapLock{
@@ -728,22 +747,18 @@ private:
     }
 
 private:
-    static constexpr size_t kMaxBuckets = SizeHandler::kMaxCacheIndex;
-    std::forward_list<Span*> spanBuckets_[kMaxBuckets];
+    static constexpr size_t kMaxBuckets = SizeHandler::kMaxCacheIndex + 1;
 
-    // Each bucket’s lock must be acquired ​​before accessing the bucket
-    // and its span
+    // Each bucket should be accessed while holding its lock
+    std::forward_list<Span*> spanBuckets_[kMaxBuckets];
     std::mutex bucketLocks_[kMaxBuckets];
 };
 
 // A special memlist for ThreadCache
 class TCList : public MemList {
 public:
-    // Get slow-start threshold
-    size_t threshold() { return threshold_; }
-
-    // Increase slow-start threshold
-    void slowStart() { ++threshold_; }
+    size_t getThreshold() { return threshold_; }
+    void incThreshold() { ++threshold_; }
 
 private:
     size_t threshold_ = 3;  // must > 0
@@ -752,7 +767,6 @@ private:
 // Lock-free accessed through TLS
 class ThreadCache {
 public:
-    // Acquire one memblock from ThreadCache
     MemBlock acquire(SizeHandler& sizeHandler) {
         size_t index = sizeHandler.getCacheIndex();
         auto&& bucket = memBuckets_[index];
@@ -762,16 +776,13 @@ public:
         return fetchFromCentralCache(sizeHandler);
     }
 
-    // Release one memblock to ThreadCache
     void release(MemBlock memblock, SizeHandler sizeHandler) {
         size_t index = sizeHandler.getCacheIndex();
         auto&& bucket = memBuckets_[index];
         bucket.pushNode(memblock);
 
-        // If bucket length > threshold, release a list of memblock to
-        // CentralCache
-        if (bucket.length() > bucket.threshold()) {
-            auto [head, tail] = bucket.popList(bucket.threshold());
+        if (bucket.length() > bucket.getThreshold()) {
+            auto [head, tail] = bucket.popList(bucket.length());
             CentralCache::getInstance().release(head, sizeHandler);
         }
     }
@@ -782,31 +793,27 @@ private:
         size_t index = sizeHandler.getCacheIndex();
         auto&& bucket = memBuckets_[index];
 
-        // slow-start strategy
-        size_t fixedBatchNum = sizeHandler.getBatchNum();
-        if (fixedBatchNum >= bucket.threshold()) {
-            fixedBatchNum = bucket.threshold();
-            bucket.slowStart();
+        size_t expectedNum = sizeHandler.getBatchNum();
+        if (expectedNum > bucket.getThreshold()) {
+            expectedNum = bucket.getThreshold();
+            bucket.incThreshold();
         }
 
-        auto [head, tail, n] =
-            CentralCache::getInstance().acquire(sizeHandler, fixedBatchNum);
-        if (n > 1) {
-            bucket.pushList(head.getNext(), tail, n - 1);
+        auto [head, tail, actualNum] =
+            CentralCache::getInstance().acquire(sizeHandler, expectedNum);
+        if (actualNum > 1) {
+            bucket.pushList(head.getNext(), tail, actualNum - 1);
             head.setNext(nullptr);
         }
         return head;
     }
 
 private:
-    static constexpr size_t kMaxBuckets = SizeHandler::kMaxCacheIndex;
+    static constexpr size_t kMaxBuckets = SizeHandler::kMaxCacheIndex + 1;
     TCList memBuckets_[kMaxBuckets];
 };
 
 inline thread_local ThreadCache tls_ThreadCache;
-
-template <typename T>
-inline T Singleton<T>::instance{};
 
 }  // namespace detail
 
