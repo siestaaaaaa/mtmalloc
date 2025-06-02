@@ -244,7 +244,7 @@ private:
     static T instance;
 };
 
-// An obj-pool for Span, RadixTreeV3::Node, RadixTreeV3::Leaf
+// An obj-pool for Span, RadixTreeV3::Node2, RadixTreeV3::Node3
 // Should be accessed while holding PageHeap's lock
 template <typename T>
 class ObjectPool : public Singleton<ObjectPool<T>> {
