@@ -244,7 +244,7 @@ private:
     static T instance;
 };
 
-// An obj-pool for Span, RadixTreeV3::Node, RadixTreeV3::Leaf
+// An obj-pool for Span, RadixTreeV3::Node2, RadixTreeV3::Node3
 // Should be accessed while holding PageHeap's lock
 template <typename T>
 class ObjectPool : public Singleton<ObjectPool<T>> {
@@ -437,6 +437,13 @@ public:
     static constexpr size_t kMaxHeapIndex = 129;
 
     // Configure align rules
+    /*
+        0~127B - 8B
+        128~1023B - 16B
+        1024~8091B - 128B
+        8092~65535B - 1024B
+        >=65536B - 8092B
+    */
     struct AlignConfig {
         const size_t minSize;
         const size_t alignNum;
@@ -447,7 +454,8 @@ public:
         {8 * 1024, 1024},
         {1024, 128},
         {128, 16},
-        {0, 8}};
+        {0, 8}
+    };
 
     // Configure cache hash rules
     struct CacheIndexConfig {
@@ -460,7 +468,8 @@ public:
         {8 * 1024, 1024, 128},
         {1024, 128, 72},
         {128, 16, 16},
-        {0, 8, 0}};
+        {0, 8, 0}
+    };
 
     /*Configure Segment End*/
 
